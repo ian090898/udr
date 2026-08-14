@@ -68,16 +68,17 @@ const (
 )
 
 type Configuration struct {
-	ReadIdleTimeout *time.Duration `yaml:"readIdleTimeout,omitempty" valid:"optional"`
-	PingTimeout     *time.Duration `yaml:"pingTimeout,omitempty" valid:"optional"`
-	IdleTimeout     *time.Duration `yaml:"idleTimeout,omitempty" valid:"optional"`
-	NfInstanceId    string         `yaml:"nfInstanceId,omitempty" valid:"optional,uuidv4"`
-	Sbi             *Sbi           `yaml:"sbi" valid:"required"`
-	Metrics         *Metrics       `yaml:"metrics,omitempty" valid:"optional"`
-	DbConnectorType DbType         `yaml:"dbConnectorType" valid:"required,in(mongodb)"`
-	Mongodb         *Mongodb       `yaml:"mongodb" valid:"optional"`
-	NrfUri          string         `yaml:"nrfUri" valid:"url,required"`
-	NrfCertPem      string         `yaml:"nrfCertPem,omitempty" valid:"optional"`
+    ReadIdleTimeout *time.Duration `yaml:"readIdleTimeout,omitempty" valid:"optional"`
+    PingTimeout     *time.Duration `yaml:"pingTimeout,omitempty" valid:"optional"`
+    IdleTimeout     *time.Duration `yaml:"idleTimeout,omitempty" valid:"optional"`
+    NfInstanceId    string         `yaml:"nfInstanceId,omitempty" valid:"optional,uuidv4"`
+    Sbi             *Sbi           `yaml:"sbi" valid:"required"`
+    Metrics         *Metrics       `yaml:"metrics,omitempty" valid:"optional"`
+    DbConnectorType DbType         `yaml:"dbConnectorType" valid:"required,in(mongodb)"`
+    Mongodb         *Mongodb       `yaml:"mongodb" valid:"optional"`
+    NrfUri          string         `yaml:"nrfUri" valid:"url,required"`
+    NrfCertPem      string         `yaml:"nrfCertPem,omitempty" valid:"optional"`
+    NrfNfInstanceId string         `yaml:"nrfNfInstanceId,omitempty" valid:"optional,uuidv4"`
 }
 
 type Logger struct {
