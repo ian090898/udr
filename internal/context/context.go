@@ -8,7 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/openapi/oauth"
@@ -28,8 +31,8 @@ const (
 
 func Init() {
 	udrContext.Name = "udr"
-	udrContext.EeSubscriptionIDGenerator = 1
-	udrContext.SdmSubscriptionIDGenerator = 1
+	udrContext.EeSubscriptionIDGenerator.Store(0)
+	udrContext.SdmSubscriptionIDGenerator.Store(0)
 	udrContext.SubscriptionDataSubscriptionIDGenerator = 1
 	udrContext.PolicyDataSubscriptionIDGenerator = 1
 	udrContext.SubscriptionDataSubscriptions = make(map[subsId]*SubscriptionDataSubscriptionRecord)
@@ -57,8 +60,9 @@ type UDRContext struct {
 	NfId                                    string
 	NrfUri                                  string
 	NrfCertPem                              string
-	EeSubscriptionIDGenerator               int
-	SdmSubscriptionIDGenerator              int
+	NrfNfInstanceID                         string
+	EeSubscriptionIDGenerator               atomic.Uint64
+	SdmSubscriptionIDGenerator              atomic.Uint64
 	SubscriptionDataSubscriptionIDGenerator int
 	PolicyDataSubscriptionIDGenerator       int
 	InfluenceDataSubscriptionIDGenerator    *rand.Rand
@@ -72,7 +76,10 @@ type UDRContext struct {
 	OAuth2Required                          bool
 }
 
+// UESubsData holds the per-UE subscriptions. The embedded mutex guards both maps:
+// take Lock() for any write and RLock() for reads.
 type UESubsData struct {
+	sync.RWMutex
 	EeSubscriptionCollection map[subsId]*EeSubscriptionCollection
 	SdmSubscriptions         map[subsId]*models.Udr_DR_SdmSubscription
 }
@@ -133,8 +140,8 @@ func (context *UDRContext) Reset() {
 		context.InfluenceDataSubscriptions.Delete(key)
 		return true
 	})
-	context.EeSubscriptionIDGenerator = 1
-	context.SdmSubscriptionIDGenerator = 1
+	context.EeSubscriptionIDGenerator.Store(0)
+	context.SdmSubscriptionIDGenerator.Store(0)
 	context.SubscriptionDataSubscriptionIDGenerator = 1
 	context.PolicyDataSubscriptionIDGenerator = 1
 	context.InfluenceDataSubscriptionIDGenerator = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
@@ -226,6 +233,22 @@ func (context *UDRContext) GetIPv4GroupUri(udrServiceType UDRServiceType) string
 	return fmt.Sprintf("%s://%s:%d%s", context.UriScheme, context.RegisterIPv4, context.SBIPort, serviceUri)
 }
 
+// GetOrCreateUESubsData returns the UESubsData of ueId, creating it if absent.
+func (context *UDRContext) GetOrCreateUESubsData(ueId string) *UESubsData {
+	value, _ := context.UESubsCollection.LoadOrStore(ueId, new(UESubsData))
+	return value.(*UESubsData)
+}
+
+// NewSdmSubscriptionID returns a unique SDM subscription ID (starting from 1).
+func (context *UDRContext) NewSdmSubscriptionID() string {
+	return strconv.FormatUint(context.SdmSubscriptionIDGenerator.Add(1), 10)
+}
+
+// NewEeSubscriptionID returns a unique EE subscription ID (starting from 1).
+func (context *UDRContext) NewEeSubscriptionID() string {
+	return strconv.FormatUint(context.EeSubscriptionIDGenerator.Add(1), 10)
+}
+
 // Create new UDR context
 func GetSelf() *UDRContext {
 	return &udrContext
@@ -245,14 +268,176 @@ func NewInfluenceDataSubscriptionId() string {
 	return fmt.Sprintf("%08x", GetSelf().InfluenceDataSubscriptionIDGenerator.Uint32())
 }
 
+// The subs-to-notify maps below are written by HTTP handlers while notification
+// goroutines read them; every access must go through context.mtx. Snapshots copy
+// the record pointers under the lock so callers can fan out unlocked — safe
+// because handlers only insert, delete, or replace whole records and never
+// mutate a record in place.
+
+// CreateSubscriptionDataSubscription allocates the subscription ID and inserts
+// the record inside one critical section so concurrent POSTs can neither race
+// on the map nor hand out duplicate IDs.
+func (context *UDRContext) CreateSubscriptionDataSubscription(
+	subscription *models.Udr_DR_SubscriptionDataSubscriptions,
+	callbackTarget SubscriptionCallbackTarget,
+) string {
+	context.mtx.Lock()
+	defer context.mtx.Unlock()
+	newSubscriptionID := strconv.Itoa(context.SubscriptionDataSubscriptionIDGenerator)
+	context.SubscriptionDataSubscriptions[newSubscriptionID] = &SubscriptionDataSubscriptionRecord{
+		Subscription:   subscription,
+		CallbackTarget: callbackTarget,
+	}
+	context.SubscriptionDataSubscriptionIDGenerator++
+	return newSubscriptionID
+}
+
+func (context *UDRContext) DeleteSubscriptionDataSubscription(subsId string) bool {
+	context.mtx.Lock()
+	defer context.mtx.Unlock()
+	if _, ok := context.SubscriptionDataSubscriptions[subsId]; !ok {
+		return false
+	}
+	delete(context.SubscriptionDataSubscriptions, subsId)
+	return true
+}
+
+func (context *UDRContext) SubscriptionDataSubscriptionsSnapshot() []*SubscriptionDataSubscriptionRecord {
+	context.mtx.RLock()
+	defer context.mtx.RUnlock()
+	snapshot := make([]*SubscriptionDataSubscriptionRecord, 0, len(context.SubscriptionDataSubscriptions))
+	for _, record := range context.SubscriptionDataSubscriptions {
+		snapshot = append(snapshot, record)
+	}
+	return snapshot
+}
+
+// CreatePolicyDataSubscription is the policy-data counterpart of
+// CreateSubscriptionDataSubscription.
+func (context *UDRContext) CreatePolicyDataSubscription(
+	subscription *models.Udr_DR_PolicyDataSubscription,
+	callbackTarget SubscriptionCallbackTarget,
+) string {
+	context.mtx.Lock()
+	defer context.mtx.Unlock()
+	newSubscriptionID := strconv.Itoa(context.PolicyDataSubscriptionIDGenerator)
+	context.PolicyDataSubscriptions[newSubscriptionID] = &PolicyDataSubscriptionRecord{
+		Subscription:   subscription,
+		CallbackTarget: callbackTarget,
+	}
+	context.PolicyDataSubscriptionIDGenerator++
+	return newSubscriptionID
+}
+
+// PutPolicyDataSubscription replaces the record instead of writing through it,
+// so a snapshot taken before the PUT never observes a half-updated record.
+func (context *UDRContext) PutPolicyDataSubscription(
+	subsId string, subscription *models.Udr_DR_PolicyDataSubscription,
+) bool {
+	context.mtx.Lock()
+	defer context.mtx.Unlock()
+	record, ok := context.PolicyDataSubscriptions[subsId]
+	if !ok || record == nil {
+		return false
+	}
+	context.PolicyDataSubscriptions[subsId] = &PolicyDataSubscriptionRecord{
+		Subscription:   subscription,
+		CallbackTarget: record.CallbackTarget,
+	}
+	return true
+}
+
+func (context *UDRContext) DeletePolicyDataSubscription(subsId string) bool {
+	context.mtx.Lock()
+	defer context.mtx.Unlock()
+	if _, ok := context.PolicyDataSubscriptions[subsId]; !ok {
+		return false
+	}
+	delete(context.PolicyDataSubscriptions, subsId)
+	return true
+}
+
+func (context *UDRContext) PolicyDataSubscriptionsSnapshot() []*PolicyDataSubscriptionRecord {
+	context.mtx.RLock()
+	defer context.mtx.RUnlock()
+	snapshot := make([]*PolicyDataSubscriptionRecord, 0, len(context.PolicyDataSubscriptions))
+	for _, record := range context.PolicyDataSubscriptions {
+		snapshot = append(snapshot, record)
+	}
+	return snapshot
+}
+
 func (c *UDRContext) GetTokenCtx(serviceName models.Nrf_NFMgmt_ServiceName, targetNF models.Nrf_NFMgmt_NFType) (
 	context.Context, *models.ProblemDetails, error,
 ) {
 	if !c.OAuth2Required {
 		return context.TODO(), nil, nil
 	}
-	return oauth.GetTokenCtx(models.Nrf_NFMgmt_NFType_UDR, targetNF,
-		c.NfId, c.NrfUri, string(serviceName))
+	return oauth.GetTokenCtx(c.tokenRequest(serviceName, targetNF))
+}
+
+func (c *UDRContext) GetTokenCtxForNFInstance(serviceName models.Nrf_NFMgmt_ServiceName,
+	targetNF models.Nrf_NFMgmt_NFType, targetNFInstanceID string,
+) (context.Context, *models.ProblemDetails, error) {
+	if !c.OAuth2Required {
+		return context.TODO(), nil, nil
+	}
+	targetID, err := uuid.Parse(strings.TrimSpace(targetNFInstanceID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid target NF instance ID: %w", err)
+	}
+	if targetID.Version() != 4 {
+		return nil, nil, fmt.Errorf("invalid target NF instance ID: UUID must be version 4")
+	}
+	return oauth.GetTokenCtx(c.tokenRequestForNFInstance(serviceName, targetNF, targetNFInstanceID))
+}
+
+func (c *UDRContext) GetTokenCtxForNRF(serviceName models.Nrf_NFMgmt_ServiceName) (
+	context.Context, *models.ProblemDetails, error,
+) {
+	return c.GetTokenCtxForNFInstance(serviceName, models.Nrf_NFMgmt_NFType_NRF, c.NrfNfInstanceID)
+}
+
+func (c *UDRContext) tokenRequest(
+	serviceName models.Nrf_NFMgmt_ServiceName,
+	targetNF models.Nrf_NFMgmt_NFType,
+) oauth.TokenRequest {
+	return oauth.TokenRequest{
+		ConsumerNFType:       models.Nrf_NFMgmt_NFType_UDR,
+		ConsumerNFInstanceID: c.NfId,
+		TargetNFType:         targetNF,
+		NRFURI:               c.NrfUri,
+		Scope:                string(serviceName),
+	}
+}
+
+func (c *UDRContext) tokenRequestForNFInstance(serviceName models.Nrf_NFMgmt_ServiceName,
+	targetNF models.Nrf_NFMgmt_NFType, targetNFInstanceID string,
+) oauth.TokenRequest {
+	request := c.tokenRequest(serviceName, targetNF)
+	request.TargetNFInstanceID = targetNFInstanceID
+	return request
+}
+
+func (c *UDRContext) SetOAuth2Required(required bool) error {
+	if !required {
+		c.OAuth2Required = false
+		c.NrfNfInstanceID = ""
+		return nil
+	}
+	if strings.TrimSpace(c.NrfCertPem) == "" {
+		return fmt.Errorf("OAuth2 enabled but NRF certificate path is empty")
+	}
+	if strings.TrimSpace(c.NrfUri) == "" {
+		return fmt.Errorf("OAuth2 enabled but NRF URI is empty")
+	}
+	nrfNfInstanceID, err := oauth.NFInstanceIDFromCertificate(c.NrfCertPem)
+	if err != nil {
+		return fmt.Errorf("derive trusted NRF instance ID from certificate: %w", err)
+	}
+	c.NrfNfInstanceID = nrfNfInstanceID
+	c.OAuth2Required = true
+	return nil
 }
 
 func (c *UDRContext) OAuth2Enabled() bool {
@@ -265,6 +450,10 @@ func (c *UDRContext) AuthorizationCheck(token string, serviceName models.Nrf_NFM
 		return nil
 	}
 
-	logger.UtilLog.Debugf("UDRContext::AuthorizationCheck: token[%s] serviceName[%s]\n", token, serviceName)
-	return oauth.VerifyOAuth(token, string(serviceName), c.NrfCertPem)
+	logger.UtilLog.Debugf("UDRContext::AuthorizationCheck: tokenPresent[%t] serviceName[%s]",
+		token != "", serviceName)
+	return oauth.VerifyOAuth(token, string(serviceName), oauth.AudiencePolicy{
+		NFInstanceID: c.NfId,
+		NFType:       models.Nrf_NFMgmt_NFType_UDR,
+	}, c.NrfNfInstanceID, c.NrfCertPem)
 }
